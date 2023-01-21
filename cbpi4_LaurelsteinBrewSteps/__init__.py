@@ -42,11 +42,8 @@ class Laurelstein_NotificationStep(CBPiStep):
         await self.next()
 
     async def on_start(self):
-        self.summary = self.props.get("Notification","")
         self.AutoNext = False if self.props.get("AutoNext", "No") == "No" else True
-
-        self.alarm = self.props.get("Alarm", None)
-        
+        self.alarm = self.props.get("Alarm", None)        
         await self.push_update()
 
     async def on_stop(self):
@@ -54,18 +51,15 @@ class Laurelstein_NotificationStep(CBPiStep):
         await self.push_update()
 
     async def run(self):
-        if self.alarm is not None:
-            await self.actor_on(self.alarm)
+        self.summary = self.props.get("Notification","")
+        await self.actor_on(self.alarm)
         
         while self.running == True:
+            self.cbpi.notify(self.name, self.props.get("Notification",""), NotificationType.INFO)
             if self.AutoNext == True:
-                self.cbpi.notify(self.name, self.props.get("Notification",""), NotificationType.INFO)
                 await self.next()
             else:
-                self.cbpi.notify(self.name, self.props.get("Notification",""), NotificationType.SUCCESS)
-                notified = True
                 await self.push_update()
-
             await asyncio.sleep(10)
 
         return StepResult.DONE
@@ -97,14 +91,19 @@ class Laurelstein_MashInStep(CBPiStep):
         await self.push_update()
 
     async def on_stop(self):
+        self.summary = ""
         await self.push_update()
 
     async def run(self):        
+        alarmed = False
         while self.running == True:
-            await asyncio.sleep(10)
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.hlt.target_temp and self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
-                self.cbpi.notify(self.name, 'Target Temps reached. Add malts and salts, and move to next step.', NotificationType.SUCCESS)
+                if alarmed == False:
+                    await self.actor_on(self.alarm)
+                    alarmed = True
                 self.summary = "Target Temps reached."
+                self.cbpi.notify(self.name, 'Target Temps reached. Add malts and salts, and move to next step.', NotificationType.SUCCESS)
+            await asyncio.sleep(10)
                 
         return StepResult.DONE
     
@@ -145,8 +144,7 @@ class Laurelstein_MashStep(CBPiStep):
         self.timer_done = True
         self.summary = "Mash Timer Expired."
         self.cbpi.notify(self.name, 'Mash Timer Expired.  Move to next step.', NotificationType.SUCCESS)
-        if self.alarm is not None:
-            await self.actor_on(self.alarm)
+        await self.actor_on(self.alarm)
         await self.push_update()
         
     async def on_timer_update(self,timer, seconds):
@@ -185,30 +183,23 @@ class Laurelstein_MashStep(CBPiStep):
         self.timer = Timer(int(self.props.get("Timer",0)) *60 ,on_update=self.on_timer_update, on_done=self.on_timer_done)
 
     async def run(self):
-        last_alarm = 61
-        while self.running == True:
-            await asyncio.sleep(1)
-                                            
+        while self.running == True:                                            
             if self.timer_done is not True and self.timer.is_running is not True:
                 # Start Timer if it's not running
                 self.timer.start()
                 self.timer.is_running = True
                 estimated_completion_time = datetime.fromtimestamp(time.time()+ (int(self.props.get("Timer",0)))*60)
                 self.cbpi.notify(self.name, 'Timer started. Estimated completion: {}'.format(estimated_completion_time.strftime("%H:%M")), NotificationType.INFO)            
+            
+            if abs(self.get_sensor_value(self.mash_tun.sensor).get("value") - self.mash_tun.target_temp) > 2:
+                self.cbpi.notify(self.name, 'Mash Tun Temp has strayed from Target Temp by two degrees or more!!!', NotificationType.WARNING)
+                await self.actor_on(self.alarm)
+            
+            if self.timer_done is True:
+                self.cbpi.notify(self.name, 'Mash Timer Expired.  Move to next step.', NotificationType.WARNING)
 
-            # only notify/alarm every 1 minute, max
-            # TODO: put this in a separate Monitor thread
-            if last_alarm > 60:
-                if abs(self.get_sensor_value(self.mash_tun.sensor).get("value") - self.mash_tun.target_temp) > 2:
-                    self.cbpi.notify(self.name, 'Mash Tun Temp has strayed from Target Temp by two degrees or more!!!', NotificationType.WARNING)
-                    if self.alarm is not None:
-                         await self.actor_on(self.alarm)
-                    last_alarm = 0
-                if self.timer_done is True:
-                    self.cbpi.notify(self.name, 'Mash Timer Expired.  Move to next step.', NotificationType.WARNING)
-                    last_alarm = 0                    
-            last_alarm = last_alarm + 1
-    
+            await asyncio.sleep(10)
+
         return StepResult.DONE
 
 @parameters([Property.Kettle(label="HLT", description="HLT"),
@@ -216,7 +207,8 @@ class Laurelstein_MashStep(CBPiStep):
              Property.Kettle(label="Mash Tun", description="Mash Tun"),
              Property.Number(label="Mash Tun Target Temp", configurable=True,
                              description="Mash Tun won't be direct-fired, but this step will end when Mash Tun target temp is reached"),
-             Property.Actor(label="HERMS Pump", description="HERMS Pump")])
+             Property.Actor(label="HERMS Pump", description="HERMS Pump"),
+             Property.Actor(label="Alarm", description="Alarm to sound when Mash Tun target temp is reached.")])
 
 class Laurelstein_MashOutStep(CBPiStep):
 
@@ -229,14 +221,12 @@ class Laurelstein_MashOutStep(CBPiStep):
         self.hlt.target_temp = float(self.props.get("HLT Target Temp", 0))
         self.mash_tun = self.get_kettle(self.props.get("Mash Tun", None))
         self.mash_tun.target_temp = float(self.props.get("Mash Tun Target Temp", 0))
-        
-        # PID HLT
-        await setAutoMode(self.cbpi, self.hlt, True)
-
-        # Start HERMS
         self.herms_pump = self.props.get("HERMS Pump", None)
-        await self.actor_on(self.herms_pump)
+        self.alarm = self.props.get("Alarm", None)
         
+        # PID control HLT and start up HERMS pump
+        await setAutoMode(self.cbpi, self.hlt, True)
+        await self.actor_on(self.herms_pump)        
         await self.push_update()
 
     async def on_stop(self):
@@ -247,9 +237,9 @@ class Laurelstein_MashOutStep(CBPiStep):
 
     async def run(self):
         while self.running == True:
-            await asyncio.sleep(10)
             if self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
                 self.cbpi.notify(self.name, 'Target Temp reached. Prepare to Sparge, then move to next step.', NotificationType.SUCCESS)
+            await asyncio.sleep(10)
             
         return StepResult.DONE
     
@@ -296,38 +286,36 @@ class Laurelstein_SpargeStep(CBPiStep):
         await self.push_update()
 
     async def on_stop(self):
-        self.summary = "Boil Kettle full."
-        
-        # Stop HLT PID and both Pumps
-        await setAutoMode(self.cbpi, self.hlt, False)
-        await self.actor_off(self.hlt_sparge_pump)
-        await self.actor_off(self.wort_sparge_pump)
-        
-        # Alarm if specified
-        if self.alarm is not None:
-            await self.actor_on(self.alarm)
-            
-        self.cbpi.notify(self.name, 'Boil Kettle Full. Prepare to Boil, then move to next step.',
-                         action=[NotificationAction("Next Step", self.NextStep)])
+        self.summary = "Boil Kettle full."            
         await self.push_update()
 
     async def run(self):
         # Run until boil kettle is full
-        while self.running == True and self.boil_kettle_high_float_switch.instance.state == False:
-            await asyncio.sleep(1)
+        boil_kettle_filled = False
+        while self.running == True:
+            if self.boil_kettle_high_float_switch.instance.state == True and boil_kettle_filled == False:
+                self.summary = "Boil Kettle Full. Prepare to Boil, then move to next step."
+                self.cbpi.notify(self.name, 'Boil Kettle Full. Prepare to Boil, then move to next step.', NotificationType.SUCCESS)
             
-            # Turn on HLT Sparge pump if Mash Tun float is low
-            if self.mash_tun_high_float_switch.instance.state == False:
-                await self.actor_on(self.hlt_sparge_pump)
+                # Stop HLT PID and both Pumps
+                await setAutoMode(self.cbpi, self.hlt, False)
+                await self.actor_off(self.hlt_sparge_pump)
+                await self.actor_off(self.wort_sparge_pump)
+        
+                # Alarm if specified
+                await self.actor_on(self.alarm)
+                boil_kettle_filled = True                
+            elif boil_kettle_filled == False:
+                # Turn on HLT Sparge pump if Mash Tun float is low
+                if self.mash_tun_high_float_switch.instance.state == False:
+                    await self.actor_on(self.hlt_sparge_pump)
             
-            # PID Boil Kettle if there's enough Wort in the Boil Kettle
-            if (self.boil_kettle.instance is None or self.boil_kettle.instance.state == False):
-                if self.boil_kettle_low_float_switch is not None:
-                    if self.boil_kettle_low_float_switch.instance.state == true:
-                        await setAutoMode(self.cbpi, self.boil_kettle, True)
-                else:
+                # PID Boil Kettle if there's enough Wort in the Boil Kettle
+                if self.boil_kettle_low_float_switch.instance.state == True and (self.boil_kettle.instance is None or self.boil_kettle.instance.state == False):
                     await setAutoMode(self.cbpi, self.boil_kettle, True)
-            
+
+            await asyncio.sleep(1)
+
         return StepResult.DONE
 
 def setup(cbpi):
