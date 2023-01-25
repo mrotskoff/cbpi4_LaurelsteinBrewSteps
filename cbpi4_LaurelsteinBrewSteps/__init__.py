@@ -3,10 +3,11 @@ import asyncio
 import aiohttp
 from aiohttp import web
 from cbpi.api.step import CBPiStep, StepResult
-from cbpi.api.timer import Timer
+#from cbpi.api.timer import Timer
 from cbpi.api.dataclasses import Kettle, Props
 from datetime import datetime
 import time
+import math
 from cbpi.api import *
 import logging
 from socket import timeout
@@ -31,39 +32,206 @@ async def setAutoMode(cbpi, kettle, auto_state):
     except Exception as e:
         logging.error("Failed to switch KettleLogic {} {}".format(kettle.id, e))
 
+async def toggle_on(cbpi, actor):
+    if actor is not None:
+        logging.info("turning on actor " + actor)
+        await cbpi.actor_on(actor)
 
+async def toggle_off(cbpi, actor):
+    if actor is not None:
+        logging.info("turning off actor " + actor)
+        await cbpi.actor_off(actor)
+
+def format_time(time):
+    pattern_h = '{0:02d}:{1:02d}:{2:02d}'
+    pattern_d = '{0:02d}D {1:02d}:{2:02d}:{3:02d}'
+    seconds = time % 60
+    minutes = math.floor(time / 60) % 60
+    hours = math.floor(time / 3600) % 24
+    days = math.floor(time / 86400)
+    if days != 0:
+        remaining_time = pattern_d.format(days, hours, minutes, seconds)
+    else:
+        remaining_time = pattern_h.format(hours, minutes, seconds)
+    return remaining_time
+
+class Timer(object):
+
+    def __init__(self, timeout, on_done = None, on_update = None) -> None:
+        super().__init__()
+        self.timeout = timeout
+        self._timeout = self.timeout
+        self._task = None
+        self._callback = on_done
+        self._update = on_update
+        self.start_time = None
+        self.end_time = None
+    
+    def done(self, task):
+        if self._callback is not None:
+            asyncio.create_task(self._callback(self))
+
+    async def _job(self):
+        self.start_time = int(time.time())
+        self.end_time = self.start_time + self._timeout
+        self.count = self.end_time - self.start_time
+        
+        try:
+
+            while self.count > 0:
+                self.count = (self.end_time - int(time.time()))
+                if self._update is not None:
+                    await self._update(self, self.count)
+                await asyncio.sleep(1)        
+        except asyncio.CancelledError:
+            end = int(time.time())
+            duration = end - self.start_time
+            self._timeout = self._timeout - duration
+
+    async def add(self, seconds):
+        self.end_time = self.end_time + seconds
+        self._timeout = self._timeout + seconds
+
+    def start(self):
+        self._task = asyncio.create_task(self._job())
+        self._task.add_done_callback(self.done)
+
+    async def stop(self):
+        if self._task and self._task.done() is False:
+            self._task.cancel()
+            await self._task
+
+    def reset(self):
+        if self.is_running is True:
+            return
+        self._timeout = self.timeout
+
+    def is_running(self):
+        return not self._task.done()
+
+    def set_time(self, timeout):
+        if self.is_running is True:
+            return
+        self._timeout = timeout
+
+    def get_time(self):
+        return self._timeout
+        
+        
 @parameters([Property.Text(label="Notification", configurable=True, description="Text for notification"),
              Property.Select(label="AutoNext", options=["Yes","No"], description="Automatically move to next step (Yes) or pause after Notification (No)"),
+             Property.Actor(label="Input", description="Input actor for moving to next step"),
              Property.Actor(label="Alarm", description="Alarm to turn on along with the notification (optional).")])
 
 class Laurelstein_NotificationStep(CBPiStep):
 
-    async def NextStep(self, **kwargs):
-        await self.next()
-
     async def on_start(self):
         self.AutoNext = False if self.props.get("AutoNext", "No") == "No" else True
-        self.alarm = self.props.get("Alarm", None)        
+        self.alarm = self.props.get("Alarm", None)
+        self.input = self.props.get("Input", None)
+        self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
         await self.push_update()
 
     async def on_stop(self):
         self.summary = ""
+        await toggle_off(self, self.alarm)
         await self.push_update()
 
     async def run(self):
+        last_notify = 10
         self.summary = self.props.get("Notification","")
-        await self.actor_on(self.alarm)
+        await toggle_on(self, self.alarm)
         
         while self.running == True:
-            self.cbpi.notify(self.name, self.props.get("Notification",""), NotificationType.INFO)
             if self.AutoNext == True:
                 await self.next()
-            else:
+            elif self.input_actor is not None and self.input_actor.instance.state == True:
+                await self.next()
+            elif last_notify >= 10:
+                self.cbpi.notify(self.name, self.props.get("Notification",""), NotificationType.INFO)
+                last_notify = 0
                 await self.push_update()
-            await asyncio.sleep(10)
+            last_notify = last_notify + 1
+            await asyncio.sleep(1)
 
         return StepResult.DONE
 
+@parameters([Property.Number(label="Timer", description="Time in Minutes", configurable=True),
+             Property.Text(label="Notification", configurable=True, description="Text for notification"),
+             Property.Select(label="AutoNext", options=["Yes","No"], description="Automatically move to next step (Yes) or pause after Notification (No)"),
+             Property.Actor(label="Input", description="Input actor for moving to next step"),
+             Property.Actor(label="Alarm", description="Alarm to turn on along with the notification (optional).")])
+
+class Laurelstein_TimerStep(CBPiStep):
+
+    @action("Add 1 Minute to Timer", [])
+    async def add_one_timer(self):
+        if self.timer is not None:
+            self.cbpi.notify(self.name, '1 Minute added', NotificationType.INFO)
+            await self.timer.add(60)
+
+    @action("Add 5 Minutes to Timer", [])
+    async def add_five_timer(self):
+        if self.timer is not None:
+            self.cbpi.notify(self.name, '5 Minutes added', NotificationType.INFO)
+            await self.timer.add(300)       
+
+    async def on_timer_done(self, timer):
+        if self.stopped == False:
+            self.timer_expired = True
+            self.summary = "Timer Expired.  Move to next step"
+        await self.push_update()
+        
+    async def on_timer_update(self, timer, seconds):
+        self.summary = format_time(seconds)
+        await self.push_update()
+
+    async def on_start(self):        
+        self.stopped = False
+        self.timer_expired = False
+        self.AutoNext = False if self.props.get("AutoNext", "No") == "No" else True
+        self.alarm = self.props.get("Alarm", None)
+        self.input = self.props.get("Input", None)
+        self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
+        
+        if self.timer is None:
+            logging.info("Instantiating new Timer")
+            self.timer = Timer(int(self.props.get("Timer",0)) * 60, on_update=self.on_timer_update, on_done=self.on_timer_done)
+
+        logging.info("starting timer")
+        self.timer.start()
+        self.cbpi.notify(self.name, 'Timer started', NotificationType.INFO)                    
+        await self.push_update()
+
+    async def on_stop(self):
+        logging.info("stopping timer")
+        self.stopped = True
+        await self.timer.stop()
+        await toggle_off(self, self.alarm)
+        await self.push_update()
+
+    async def reset(self):
+        self.summary = ""
+        self.timer = Timer(int(self.props.get("Timer",0)) *60 ,on_update=self.on_timer_update, on_done=self.on_timer_done)
+
+    async def run(self):
+        last_warning = 10
+        while self.running == True:
+            if self.timer_expired == True:
+                # Timer Expired
+                await toggle_on(self, self.alarm)
+                if self.AutoNext:
+                    self.summary = ""
+                    await self.next()
+                elif self.input_actor is not None and self.input_actor.instance.state == True:
+                    self.summary = ""
+                    await self.next()
+                elif last_warning >= 10:
+                    self.cbpi.notify(self.name, 'Timer Expired.  Move to next step.', NotificationType.SUCCESS)
+                    last_warning = 0
+                last_warning = last_warning + 1
+            await asyncio.sleep(1)
+        return StepResult.DONE
 
 @parameters([Property.Kettle(label="HLT", description="HLT"),
              Property.Number(label="HLT Target Temp", configurable=True),
@@ -94,16 +262,19 @@ class Laurelstein_MashInStep(CBPiStep):
         self.summary = ""
         await self.push_update()
 
-    async def run(self):        
-        alarmed = False
+    async def run(self):
+        # TODO: turn on HERMS pump until hlt reaches target temp
+        
+        last_alarm = 10
         while self.running == True:
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.hlt.target_temp and self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
-                if alarmed == False:
-                    await self.actor_on(self.alarm)
-                    alarmed = True
                 self.summary = "Target Temps reached."
-                self.cbpi.notify(self.name, 'Target Temps reached. Add malts and salts, and move to next step.', NotificationType.SUCCESS)
-            await asyncio.sleep(10)
+                if last_alarm >= 10:
+                    await self.actor_on(self.alarm)
+                    self.cbpi.notify(self.name, 'Target Temps reached. Add malts and salts, and move to next step.', NotificationType.SUCCESS)
+                    last_alarm = 0
+            last_alarm = last_alarm + 1
+            await asyncio.sleep(1)
                 
         return StepResult.DONE
     
@@ -115,45 +286,44 @@ class Laurelstein_MashInStep(CBPiStep):
              Property.Number(label="Mash Tun Target Temp", configurable=True,
                              description="Mash Tun won't be direct-fired, but temp will be monitored and notifications posted if Mash Tun strays from desired temp by more than two degrees."),
              Property.Actor(label="HERMS Pump", description="HERMS Pump"),
+             Property.Select(label="AutoNext", options=["Yes","No"], description="Automatically move to next step (Yes) or pause after Notification (No)"),
+             Property.Actor(label="Input", description="Input actor for moving to next step"),
              Property.Actor(label="Alarm",
                             description="Alarm to sound when Mash timer is expired, or if Mash Tun temp strays from target temp by more than two degrees.")])
 
 class Laurelstein_MashStep(CBPiStep):
-
-    async def NextStep(self, **kwargs):
-        await self.next()
-        
-    @action("Start Timer", [])
-    async def start_timer(self):
-        if self.timer.is_running is not True:
-            self.cbpi.notify(self.name, 'Timer started', NotificationType.INFO)
-            self.timer.start()
-            self.timer.is_running = True
-        else:
-            self.cbpi.notify(self.name, 'Timer is already running', NotificationType.WARNING)
+    
+    @action("Add 1 Minute to Timer", [])
+    async def add_one_timer(self):
+        if self.timer is not None:
+            self.cbpi.notify(self.name, '1 Minute added', NotificationType.INFO)
+            await self.timer.add(60)
 
     @action("Add 5 Minutes to Timer", [])
     async def add_timer(self):
-        if self.timer.is_running == True:
+        if self.timer is not None:
             self.cbpi.notify(self.name, '5 Minutes added', NotificationType.INFO)
             await self.timer.add(300)       
-        else:
-            self.cbpi.notify(self.name, 'Timer must be running to add time', NotificationType.WARNING)
 
-    async def on_timer_done(self,timer):
-        self.timer_done = True
-        self.summary = "Mash Timer Expired."
-        self.cbpi.notify(self.name, 'Mash Timer Expired.  Move to next step.', NotificationType.SUCCESS)
-        await self.actor_on(self.alarm)
+    async def on_timer_done(self, timer):
+        logging.info("on_timer_done called, self.stopped == " + str(self.stopped))
+        if self.stopped == False:
+            self.timer_expired = True
         await self.push_update()
         
-    async def on_timer_update(self,timer, seconds):
-        self.summary = Timer.format_time(seconds)
+    async def on_timer_update(self, timer, seconds):
+        self.summary = format_time(seconds)
         await self.push_update()
-
+        
     async def on_start(self):        
-        self.summary = "Waiting for Timer..."
-
+        logging.info("on_start called")
+        self.stopped = False
+        self.timer_expired = False
+        self.AutoNext = False if self.props.get("AutoNext", "No") == "No" else True
+        self.alarm = self.props.get("Alarm", None)
+        self.input = self.props.get("Input", None)
+        self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
+        
         # PID control HLT
         self.hlt = self.get_kettle(self.props.HLT)
         self.hlt.target_temp = float(self.props.get("HLT Target Temp", 0))        
@@ -166,39 +336,56 @@ class Laurelstein_MashStep(CBPiStep):
         # Get Mash Target and Alarm (for monitoring)
         self.mash_tun = self.get_kettle(self.props.get("Mash Tun"))
         self.mash_tun.target_temp = float(self.props.get("Mash Tun Target Temp", 0))        
-        self.alarm = self.props.get("Alarm", None)
+        await setAutoMode(self.cbpi, self.mash_tun, False)        
         
-        # Create Timer
+        # Start timer
         if self.timer is None:
-            self.timer = Timer(int(self.props.get("Timer",0)) * 60 ,on_update=self.on_timer_update, on_done=self.on_timer_done)
-        
+            logging.info("Instantiating new Timer")
+            self.timer = Timer(int(int(self.props.get("Timer",0)) * 60), on_update=self.on_timer_update, on_done=self.on_timer_done)
+
+        logging.info("starting timer")
+        self.timer.start()
+        self.cbpi.notify(self.name, 'Timer started', NotificationType.INFO)                    
         await self.push_update()
 
     async def on_stop(self):
+        logging.info("stopping timer")
+        self.stopped = True
         await self.timer.stop()
-        self.summary = "Timer Stopped."        
+        await toggle_off(self, self.alarm)
         await self.push_update()
 
     async def reset(self):
+        logging.info("resetting timer")
+        self.summary = ""
         self.timer = Timer(int(self.props.get("Timer",0)) *60 ,on_update=self.on_timer_update, on_done=self.on_timer_done)
 
     async def run(self):
-        while self.running == True:                                            
-            if self.timer_done is not True and self.timer.is_running is not True:
-                # Start Timer if it's not running
-                self.timer.start()
-                self.timer.is_running = True
-                estimated_completion_time = datetime.fromtimestamp(time.time()+ (int(self.props.get("Timer",0)))*60)
-                self.cbpi.notify(self.name, 'Timer started. Estimated completion: {}'.format(estimated_completion_time.strftime("%H:%M")), NotificationType.INFO)            
-            
+        last_temp_warning = 10
+        last_timer_warning = 10
+        while self.running == True:
+            if self.timer_expired == True:
+                # Timer Expired
+                await toggle_on(self, self.alarm)
+                if self.AutoNext:
+                    self.summary = ""
+                    await self.next()
+                elif self.input_actor is not None and self.input_actor.instance.state == True:
+                    self.summary = ""
+                    await self.next()
+                elif last_timer_warning >= 10:
+                    self.cbpi.notify(self.name, 'Timer Expired.  Move to next step.', NotificationType.SUCCESS)
+                    last_timer_warning = 0
+                last_timer_warning = lastlast_timer_warningwarning + 1
+                
             if abs(self.get_sensor_value(self.mash_tun.sensor).get("value") - self.mash_tun.target_temp) > 2:
-                self.cbpi.notify(self.name, 'Mash Tun Temp has strayed from Target Temp by two degrees or more!!!', NotificationType.WARNING)
-                await self.actor_on(self.alarm)
-            
-            if self.timer_done is True:
-                self.cbpi.notify(self.name, 'Mash Timer Expired.  Move to next step.', NotificationType.WARNING)
-
-            await asyncio.sleep(10)
+                if last_temp_warning >= 10:
+                    self.cbpi.notify(self.name, 'Mash Tun Temp has strayed from Target Temp by two degrees or more!!!', NotificationType.WARNING)
+                    await toggle_on(self, self.alarm)
+                    last_temp_warning = 0
+            last_temp_warning = last_temp_warning + 1
+                
+            await asyncio.sleep(1)
 
         return StepResult.DONE
 
@@ -226,6 +413,7 @@ class Laurelstein_MashOutStep(CBPiStep):
         
         # PID control HLT and start up HERMS pump
         await setAutoMode(self.cbpi, self.hlt, True)
+        await setAutoMode(self.cbpi, self.mash_tun, False)
         await self.actor_on(self.herms_pump)        
         await self.push_update()
 
@@ -236,10 +424,14 @@ class Laurelstein_MashOutStep(CBPiStep):
         await self.push_update()
 
     async def run(self):
+        last_warning = 10
         while self.running == True:
             if self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
-                self.cbpi.notify(self.name, 'Target Temp reached. Prepare to Sparge, then move to next step.', NotificationType.SUCCESS)
-            await asyncio.sleep(10)
+                if last_warning >= 10:
+                    self.cbpi.notify(self.name, 'Target Temp reached. Prepare to Sparge, then move to next step.', NotificationType.SUCCESS)
+                    last_warning = 0
+            last_warning = last_warning + 1
+            await asyncio.sleep(1)
             
         return StepResult.DONE
     
@@ -327,7 +519,8 @@ def setup(cbpi):
     :return: 
     '''    
     
-    cbpi.plugin.register("Laurelstein Notification Step", Laurelstein_NotificationStep)    
+    cbpi.plugin.register("Laurelstein Notification Step", Laurelstein_NotificationStep)
+    cbpi.plugin.register("Laurelstein Timer Step", Laurelstein_TimerStep)
     cbpi.plugin.register("Laurelstein Mash-In Step", Laurelstein_MashInStep)
     cbpi.plugin.register("Laurelstein Mash Step", Laurelstein_MashStep)
     cbpi.plugin.register("Laurelstein Mash-Out Step", Laurelstein_MashOutStep)
