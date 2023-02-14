@@ -161,6 +161,7 @@ class Laurelstein_MashInStep(CBPiStep):
         self.summary = ""
         # turn off the mash tun kettle
         await setAutoMode(self.cbpi, self.mash_tun, False)
+        await toggle_off(self, self.alarm)
         await self.push_update()
 
     async def run(self):
@@ -168,16 +169,17 @@ class Laurelstein_MashInStep(CBPiStep):
         while self.running == True:
             
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.mash_tun.target_temp:
-                toggle_on(self, self.herms_pump)
+                await toggle_on(self, self.herms_pump)
             
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.hlt.target_temp and self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
                 self.summary = "Target Temps reached."
                 if last_alarm >= 10:
-                    await self.actor_on(self.alarm)
+                    await toggle_on(self, self.alarm)
                     self.cbpi.notify(self.name, 'Target Temps reached. Add malts and salts, and move to next step.', NotificationType.SUCCESS)
-                    last_alarm = 0
+                    last_alarm = 0                    
                 if checkActorOn(self.input_actor):
                     await self.next()
+                await self.push_update()
             last_alarm = last_alarm + 1            
             
             await asyncio.sleep(1)
@@ -596,7 +598,52 @@ class Laurelstein_BoilStep(CBPiStep):
 
         return StepResult.DONE
 
+@parameters([Property.Kettle(label="Boil Kettle", description="Boil Kettle"),
+             Property.Number(label="Target Temp", configurable=True),
+             Property.Actor(label="Wort Pump", description="Wort Pump"),
+             Property.Actor(label="Alarm", description="Alarm to turn on along with the notification (optional)."),
+             Property.Actor(label="Input", description="Input actor for moving to next step")])
 
+class Laurelstein_CooldownStep(CBPiStep):
+    
+    async def on_start(self):
+        self.summary = "Waiting for Target Temp..."
+        self.boil_kettle = self.get_kettle(self.props.get("Boil Kettle", None))
+        self.boil_kettle.target_temp = float(self.props.get("Target Temp", 50))
+        self.wort_pump = self.props.get("Wort Pump", None)
+        self.alarm = self.props.get("Alarm", None)
+        self.input = self.props.get("Input", None)
+        self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
+        await self.push_update()
+
+    async def on_stop(self):
+        self.summary = ""
+        await toggle_off(self, self.wort_pump)
+        await toggle_off(self, self.alarm)
+        await self.push_update()
+
+    async def run(self):
+        last_alarm = 10
+        while self.running == True:
+            
+            if self.get_sensor_value(self.boil_kettle.sensor).get("value") > self.boil_kettle.target_temp:
+                await toggle_on(self, self.wort_pump)
+            
+            if self.get_sensor_value(self.boil_kettle.sensor).get("value") <= self.boil_kettle.target_temp:
+                await toggle_off(self, self.wort_pump)
+                if last_alarm >= 10:
+                    self.summary = "Target Temp reached."
+                    await toggle_on(self, self.alarm)
+                    self.cbpi.notify(self.name, 'Target Temp reached. Transfer wort to fermenter.', NotificationType.SUCCESS)
+                    last_alarm = 0
+                    await self.push_update()
+                if checkActorOn(self.input_actor):
+                    await self.next()
+            last_alarm = last_alarm + 1                            
+            await asyncio.sleep(1)
+                
+        return StepResult.DONE
+    
 # Utility functions
 
 async def setAutoMode(cbpi, kettle, auto_state):
@@ -716,6 +763,7 @@ def setup(cbpi):
     cbpi.plugin.register("Laurelstein Sparge Step", Laurelstein_SpargeStep)
     cbpi.plugin.register("Laurelstein Sparge With Hardwired Floats Step", Laurelstein_SpargeWithHardwiredFloatsStep)
     cbpi.plugin.register("Laurelstein Boil Step", Laurelstein_BoilStep)
+    cbpi.plugin.register("Laurelstein Cooldown Step", Laurelstein_CooldownStep)
     
     
     
