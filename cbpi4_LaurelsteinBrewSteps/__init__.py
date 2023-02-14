@@ -433,6 +433,7 @@ class Laurelstein_SpargeStep(CBPiStep):
         self.summary = ""
         # Stop HLT PID and both Pumps
         await setAutoMode(self.cbpi, self.hlt, False)
+        await setAutoMode(self.cbpi, self.boil_kettle, False)
         await toggle_off(self, self.hlt_sparge_pump)
         await toggle_off(self, self.wort_sparge_pump)
         await toggle_off(self, self.alarm)
@@ -508,7 +509,7 @@ class Laurelstein_BoilStep(CBPiStep):
         if self.stopped == False:
             self.timer_expired = True
         await self.push_update()
-        
+
     async def on_timer_update(self, timer, seconds):
         self.summary = format_time(seconds)
         self.remaining_seconds = seconds
@@ -522,14 +523,13 @@ class Laurelstein_BoilStep(CBPiStep):
         self.alarm = self.props.get("Alarm", None)
         self.input = self.props.get("Input", None)
         self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
-        self.bkb = self.props.get("Boil Kettle Burner", None)
-        self.boil_kettle_burner = None if self.bkb is None else self.cbpi.actor.find_by_id(self.bkb)
+
+        self.burner = self.props.get("Boil Kettle Burner", None)
+        await self.actor_on(self.burner)
+
         self.hops_added=["","","","","",""]
         self.remaining_seconds = None
-        
-        # Start Boil Kettle Burner
-        await toggle_on(self, self.boil_kettle_burner)
-        
+                
         # Start timer
         if self.timer is None:
             logging.info("Instantiating new Timer")
@@ -544,7 +544,7 @@ class Laurelstein_BoilStep(CBPiStep):
         logging.info("stopping timer")
         self.stopped = True
         await self.timer.stop()
-        await toggle_off(self, self.boil_kettle_burner)
+        await self.actor_off(self.burner)
         await toggle_off(self, self.alarm)
         await self.push_update()
 
@@ -567,17 +567,23 @@ class Laurelstein_BoilStep(CBPiStep):
         last_timer_warning = 10
         while self.running == True:
             if self.timer_expired == True:
-                # Timer Expired
-                await toggle_on(self, self.alarm)
-                await toggle_off(self, self.boil_kettle_burner)
+                # Stop Boil Kettle Burner
+                if self.get_actor_state(self.burner) == True:
+                    await self.actor_off(self.burner)
+        
                 if self.AutoNext or checkActorOn(self.input_actor):
                     self.summary = ""
                     await self.next()
                 elif last_timer_warning >= 10:
+                    await toggle_on(self, self.alarm)
                     self.cbpi.notify(self.name, 'Boil Timer Expired.  Move to next step.', NotificationType.SUCCESS)
                     last_timer_warning = 0
                 last_timer_warning = last_timer_warning + 1
             else:
+                # Start Boil Kettle Burner
+                if self.get_actor_state(self.burner) == False:
+                    await self.actor_on(self.burner)
+                
                 # Check hop alerts
                 for x in range(1, 6):
                     await self.check_hop_timer(x, self.props.get("Hop_%s" % x, None), self.props.get("Hop_%s_text" % x, None))
@@ -589,6 +595,9 @@ class Laurelstein_BoilStep(CBPiStep):
             await asyncio.sleep(1)
 
         return StepResult.DONE
+
+
+# Utility functions
 
 async def setAutoMode(cbpi, kettle, auto_state):
     try:
@@ -604,16 +613,16 @@ async def setAutoMode(cbpi, kettle, auto_state):
 
 async def toggle_on(cbpi, actor):
     if actor is not None:
-        logging.info("turning on actor " + actor)
+        #logging.info("turning on actor " + str(actor))
         await cbpi.actor_on(actor)
-
+        
 async def toggle_off(cbpi, actor):
     if actor is not None:
-        logging.info("turning off actor " + actor)
+        #logging.info("turning off actor " + str(actor))
         await cbpi.actor_off(actor)
 
 def checkActorOn(actor):
-    return actor is not None and actor.instance.state == True
+    return actor is not None and actor.instance is not None and actor.instance.state == True
 
 def format_time(time):
     pattern_h = '{0:02d}:{1:02d}:{2:02d}'
