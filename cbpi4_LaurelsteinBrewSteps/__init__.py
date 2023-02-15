@@ -152,13 +152,15 @@ class Laurelstein_MashInStep(CBPiStep):
         self.alarm = self.props.get("Alarm", None)
         self.input = self.props.get("Input", None)
         self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
-        
+        self.target_reached = False
+            
         await setAutoMode(self.cbpi, self.hlt, True)
         await setAutoMode(self.cbpi, self.mash_tun, True)        
         await self.push_update()
 
     async def on_stop(self):
         self.summary = ""
+        self.target_reached = False
         # turn off the mash tun kettle
         await setAutoMode(self.cbpi, self.mash_tun, False)
         await toggle_off(self, self.alarm)
@@ -172,14 +174,17 @@ class Laurelstein_MashInStep(CBPiStep):
                 await toggle_on(self, self.herms_pump)
             
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.hlt.target_temp and self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
+                self.target_reached = True
                 self.summary = "Target Temps reached."
                 if last_alarm >= 10:
                     await toggle_on(self, self.alarm)
                     self.cbpi.notify(self.name, 'Target Temps reached. Add malts and salts, and move to next step.', NotificationType.SUCCESS)
                     last_alarm = 0                    
-                if checkActorOn(self.input_actor):
+
+            if self.target_reached and checkActorOn(self.input_actor):
                     await self.next()
-                await self.push_update()
+            
+            await self.push_update()
             last_alarm = last_alarm + 1            
             
             await asyncio.sleep(1)
@@ -194,7 +199,8 @@ class Laurelstein_MashInStep(CBPiStep):
              Property.Number(label="Mash Tun Target Temp", configurable=True,
                              description="Mash Tun won't be direct-fired, but temp will be monitored and notifications posted if Mash Tun strays from desired temp by more than two degrees."),
              Property.Actor(label="HERMS Pump", description="HERMS Pump"),
-             Property.Actor(label="Alarm", description="Alarm to sound when Mash timer is expired, or if Mash Tun temp strays from target temp by more than two degrees."),
+             Property.Actor(label="Alarm", description="Alarm to sound when Mash timer is expired."),
+             #Property.Number(label="Temp Tolerance", configurable=True, description="Number of degrees outside of Mash Tun target in which to Alarm"),
              Property.Select(label="AutoNext", options=["Yes","No"], description="Automatically move to next step (Yes) or pause after Notification (No)"),
              Property.Actor(label="Input", description="Input actor for moving to next step")
              ])
@@ -227,6 +233,7 @@ class Laurelstein_MashStep(CBPiStep):
         logging.info("on_start called")
         self.stopped = False
         self.timer_expired = False
+        #self.temp_tolerance = float(self.props.get("Temp Tolerance", None))
         self.AutoNext = False if self.props.get("AutoNext", "No") == "No" else True
         self.alarm = self.props.get("Alarm", None)
         self.input = self.props.get("Input", None)
@@ -282,10 +289,10 @@ class Laurelstein_MashStep(CBPiStep):
                     self.cbpi.notify(self.name, 'Timer Expired.  Move to next step.', NotificationType.SUCCESS)
                     last_timer_warning = 0
                 last_timer_warning = last_timer_warning + 1
-                
-            if abs(self.get_sensor_value(self.mash_tun.sensor).get("value") - self.mash_tun.target_temp) > 2:
+            '''    
+            if self.temp_tolerance is not None and abs(self.get_sensor_value(self.mash_tun.sensor).get("value") - self.mash_tun.target_temp) > self.temp_tolerance:
                 if last_temp_warning >= 10:
-                    self.cbpi.notify(self.name, 'Mash Tun Temp has strayed from Target Temp by two degrees or more!!!', NotificationType.WARNING)
+                    self.cbpi.notify(self.name, 'Mash Tun Temp has strayed from Target Temp!', NotificationType.WARNING)
                     await toggle_on(self, self.alarm)
                     last_temp_warning = 0
             last_temp_warning = last_temp_warning + 1
@@ -293,7 +300,7 @@ class Laurelstein_MashStep(CBPiStep):
             # turn off alarm if input is pressed
             if checkActorOn(self.input_actor): 
                 await toggle_off(self, self.alarm)
-                
+            '''    
             await asyncio.sleep(1)
 
         return StepResult.DONE
@@ -372,6 +379,7 @@ class Laurelstein_SpargeWithHardwiredFloatsStep(CBPiStep):
         self.boil_kettle.target_temp = float(self.props.get("Boil Kettle Target Temp", 0))
         self.input = self.props.get("Input", None)
         self.input_actor = None if self.input is None else self.cbpi.actor.find_by_id(self.input)
+        self.safety_timer = 0
         
         self.summary = "When Boil Kettle is full, move to next step..."
         await setAutoMode(self.cbpi, self.hlt, True)
@@ -382,17 +390,20 @@ class Laurelstein_SpargeWithHardwiredFloatsStep(CBPiStep):
 
     async def on_stop(self):
         self.summary = ""
+        self.safety_timer = 0
         # Stop HLT PID and both Pumps
         await setAutoMode(self.cbpi, self.hlt, False)
+        await setAutoMode(self.cbpi, self.boil_kettle, False)
         await toggle_off(self, self.hlt_sparge_pump)
         await toggle_off(self, self.wort_sparge_pump)
         await self.push_update()
 
     async def run(self):
-        while self.running == True:                
-            if checkActorOn(self.input_actor):
+        while self.running == True:
+            if self.safety_timer > 10 and checkActorOn(self.input_actor):
                 self.summary = ""
                 await self.next()
+            self.safety_timer = self.safety_timer + 1
             await asyncio.sleep(1)
 
         return StepResult.DONE
