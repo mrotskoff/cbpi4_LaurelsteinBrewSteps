@@ -182,7 +182,7 @@ class Laurelstein_MashInStep(CBPiStep):
                     last_alarm = 0                    
 
             if self.target_reached and checkActorOn(self.input_actor):
-                    await self.next()
+                await self.next()
             
             await self.push_update()
             last_alarm = last_alarm + 1            
@@ -487,7 +487,7 @@ class Laurelstein_SpargeWithHardwiredFloatsStep(CBPiStep):
     async def run(self):
         last_warning = 10
         while self.running == True:
-            if self.safety_timer > 10 and checkActorOn(self.input_actor):
+            if self.safety_timer > 100 and checkActorOn(self.input_actor):
                 self.summary = ""
                 await self.next()
             self.safety_timer = self.safety_timer + 1
@@ -752,7 +752,10 @@ class Laurelstein_CooldownStep(CBPiStep):
                     await self.push_update()
                 if checkActorOn(self.input_actor):
                     await self.next()
-                last_alarm = last_alarm + 1                            
+                last_alarm = last_alarm + 1
+            else:
+                if checkActorOn(self.wort_pump) == False:
+                    await toggle_on(self, self.wort_pump)
             await asyncio.sleep(1)
                 
         return StepResult.DONE
