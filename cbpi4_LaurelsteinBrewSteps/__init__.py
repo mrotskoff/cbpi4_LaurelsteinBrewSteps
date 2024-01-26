@@ -171,7 +171,11 @@ class Laurelstein_MashInStep(CBPiStep):
         while self.running == True:
             
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.mash_tun.target_temp:
-                await toggle_on(self, self.herms_pump)
+                if checkActorOn(self.herms_pump) != True:
+                    await toggle_on(self, self.herms_pump)
+            else:
+                if checkActorOn(self.herms_pump) == True:
+                    await toggle_off(self, self.herms_pump)
             
             if self.get_sensor_value(self.hlt.sensor).get("value") >= self.hlt.target_temp and self.get_sensor_value(self.mash_tun.sensor).get("value") >= self.mash_tun.target_temp:
                 self.target_reached = True
